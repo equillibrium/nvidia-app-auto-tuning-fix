@@ -3,6 +3,7 @@
 # 1. Missing overclocking plugin in NvContainer (junction link Plugins\localuser\oc -> Plugins\oc).
 # 2. NVIDIA App 11.0.9+ stuck slider bug (slider shows ON with +0 MHz on launch).
 # 3. NVIDIA App 11.0.9+ / Driver 621+ error on enabling scan ("Something went wrong" / NVAPI error -104 on background OC scan).
+# 4. Session 0 isolation admin consent failure in _OverClockingNvc.dll (StartOcManualScan returning result: false).
 # Requires Administrator privileges.
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -40,8 +41,24 @@ if (-not (Test-Path $nvAppDir)) {
     exit 1
 }
 
-# --- Step 1: Linking overclocking plugin ---
-Write-Host "[1/4] Checking and linking overclocking plugin to NvContainer..." -ForegroundColor Green
+# --- Step 1: Stop NVIDIA services and processes to unlock files ---
+Write-Host "[1/5] Stopping NVIDIA services and processes to unlock files..." -ForegroundColor Green
+try {
+    Stop-Service -Name "NvContainerLocalSystem" -Force -ErrorAction SilentlyContinue
+    Write-Host "  [+] Service NvContainerLocalSystem stopped" -ForegroundColor Green
+} catch {
+    # Non-fatal if already stopped
+}
+
+Get-Process -Name "nvcontainer" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process -Name "NVIDIA App" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process -Name "NVIDIA Overlay" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 800
+Write-Host "  [+] Cleaned up active processes" -ForegroundColor Green
+
+# --- Step 2: Linking overclocking plugin ---
+Write-Host ""
+Write-Host "[2/5] Checking and linking overclocking plugin to NvContainer..." -ForegroundColor Green
 if (Test-Path $ocDir) {
     if (-not (Test-Path $targetDir)) {
         try {
@@ -63,9 +80,67 @@ if (Test-Path $ocDir) {
     Write-Host "  [!] Directory '$ocDir' not found, skipping junction creation." -ForegroundColor Yellow
 }
 
-# --- Step 2: Fixing stuck slider & scan launch bugs in UI ---
+# --- Step 3: Patching Session 0 admin consent in _OverClockingNvc.dll ---
 Write-Host ""
-Write-Host "[2/4] Checking and patching NVIDIA App UI logic..." -ForegroundColor Green
+Write-Host "[3/5] Checking and patching admin consent in _OverClockingNvc.dll..." -ForegroundColor Green
+$dllLocations = @(
+    (Join-Path $ocDir "_OverClockingNvc.dll"),
+    (Join-Path $fallbackDir "_OverClockingNvc.dll")
+) | Select-Object -Unique
+
+foreach ($dllPath in $dllLocations) {
+    if (Test-Path $dllPath) {
+        try {
+            $bytes = [System.IO.File]::ReadAllBytes($dllPath)
+            # Pattern: E9 DB 47 05 00 (jmp to hasAdminConsent Session 0 check)
+            # Replace: B0 01 C3 90 90 (mov al, 1; ret; nop; nop)
+            $foundIdx = -1
+            for ($i = 0; $i -le $bytes.Length - 5; $i++) {
+                if ($bytes[$i] -eq 0xE9 -and $bytes[$i+1] -eq 0xDB -and $bytes[$i+2] -eq 0x47 -and $bytes[$i+3] -eq 0x05 -and $bytes[$i+4] -eq 0x00) {
+                    $foundIdx = $i
+                    break
+                }
+            }
+
+            if ($foundIdx -ne -1) {
+                $bakDll = "$dllPath.bak"
+                if (-not (Test-Path $bakDll)) {
+                    Copy-Item -Path $dllPath -Destination $bakDll -Force
+                    Write-Host "  [+] Backup created: $(Split-Path $dllPath -Leaf).bak" -ForegroundColor Green
+                }
+
+                $bytes[$foundIdx]     = 0xB0 # mov al, 1
+                $bytes[$foundIdx + 1] = 0x01
+                $bytes[$foundIdx + 2] = 0xC3 # ret
+                $bytes[$foundIdx + 3] = 0x90 # nop
+                $bytes[$foundIdx + 4] = 0x90 # nop
+
+                [System.IO.File]::WriteAllBytes($dllPath, $bytes)
+                Write-Host "  [+] Unlocked admin consent in $(Split-Path $dllPath -Leaf)" -ForegroundColor Green
+            } else {
+                # Check if already patched
+                $alreadyPatched = $false
+                for ($i = 0; $i -le $bytes.Length - 5; $i++) {
+                    if ($bytes[$i] -eq 0xB0 -and $bytes[$i+1] -eq 0x01 -and $bytes[$i+2] -eq 0xC3 -and $bytes[$i+3] -eq 0x90 -and $bytes[$i+4] -eq 0x90) {
+                        $alreadyPatched = $true
+                        break
+                    }
+                }
+                if ($alreadyPatched) {
+                    Write-Host "  [+] Admin consent in $(Split-Path $dllPath -Leaf) is already unlocked." -ForegroundColor Green
+                } else {
+                    Write-Host "  [!] Pattern not found in $(Split-Path $dllPath -Leaf), skipping binary patch." -ForegroundColor Yellow
+                }
+            }
+        } catch {
+            Write-Host "  [!] Could not patch $dllPath: $_" -ForegroundColor Yellow
+        }
+    }
+}
+
+# --- Step 4: Fixing stuck slider & scan launch bugs in UI ---
+Write-Host ""
+Write-Host "[4/5] Checking and patching NVIDIA App UI logic..." -ForegroundColor Green
 $patchedAny = $false
 if (Test-Path $wwwDir) {
     $mainJsFiles = Get-ChildItem -Path $wwwDir -Filter "main.*.js" -File
@@ -129,9 +204,9 @@ if (Test-Path $wwwDir) {
     Write-Host "  [!] UI directory '$wwwDir' not found." -ForegroundColor Yellow
 }
 
-# --- Step 3: Clean up cache if patched ---
+# --- Step 5: Clean UI cache and restart services ---
 Write-Host ""
-Write-Host "[3/4] Cleaning NVIDIA App UI cache..." -ForegroundColor Green
+Write-Host "[5/5] Cleaning UI cache and starting NVIDIA services..." -ForegroundColor Green
 $cacheDirs = @(
     "$env:LOCALAPPDATA\NVIDIA Corporation\NVIDIA App\CefCache",
     "$env:LOCALAPPDATA\NVIDIA Corporation\NVIDIA Overlay\CefCache"
@@ -142,26 +217,17 @@ foreach ($cDir in $cacheDirs) {
             Remove-Item -Path "$cDir\Cache\*" -Recurse -Force -ErrorAction SilentlyContinue
             Write-Host "  [+] Cleared cache: $cDir\Cache" -ForegroundColor Green
         } catch {
-            # Non-fatal if locked
+            # Non-fatal
         }
     }
 }
 
-# --- Step 4: Restart NVIDIA services and processes ---
-Write-Host ""
-Write-Host "[4/4] Restarting NVIDIA services and UI processes..." -ForegroundColor Green
 try {
-    Restart-Service -Name "NvContainerLocalSystem" -Force -ErrorAction SilentlyContinue
-    Write-Host "  [+] Service NvContainerLocalSystem restarted" -ForegroundColor Green
+    Start-Service -Name "NvContainerLocalSystem" -ErrorAction SilentlyContinue
+    Write-Host "  [+] Service NvContainerLocalSystem started" -ForegroundColor Green
 } catch {
-    Write-Host "  [!] Could not restart NvContainerLocalSystem automatically." -ForegroundColor Yellow
+    Write-Host "  [!] Could not start NvContainerLocalSystem automatically. Please start it from services.msc." -ForegroundColor Yellow
 }
-
-# Stop active UI and session container processes
-Get-Process -Name "nvcontainer" -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -ne 0 } | Stop-Process -Force -ErrorAction SilentlyContinue
-Get-Process -Name "NVIDIA App" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Get-Process -Name "NVIDIA Overlay" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Write-Host "  [+] Cleaned up active NVIDIA App processes" -ForegroundColor Green
 
 Write-Host ""
 Write-Host "=========================================================" -ForegroundColor Cyan
@@ -169,12 +235,12 @@ Write-Host "               Fix applied successfully!" -ForegroundColor Cyan
 Write-Host "=========================================================" -ForegroundColor Cyan
 Write-Host "RESULTS:" -ForegroundColor Yellow
 Write-Host "1. Overclocking plugin linked to NvContainer."
-Write-Host "2. Stuck slider bug fixed: Automatic Tuning toggle will no longer"
+Write-Host "2. Admin consent unlocked in _OverClockingNvc.dll (Session 0 fix)."
+Write-Host "3. Stuck slider bug fixed: Automatic Tuning toggle will no longer"
 Write-Host "   falsely show ON at +0 MHz."
-Write-Host "3. Tuning scan start bug fixed: clicking the toggle will now"
-Write-Host "   properly launch the manual OC scanner instead of showing"
-Write-Host "   'Something went wrong' / error -104."
-Write-Host "4. Launch NVIDIA App -> System -> Performance to start tuning."
+Write-Host "4. Tuning scan start bug fixed: clicking the toggle will now"
+Write-Host "   properly launch the manual OC scanner."
+Write-Host "5. Launch NVIDIA App -> System -> Performance to start tuning."
 Write-Host "=========================================================" -ForegroundColor Cyan
 Write-Host ""
 Read-Host "Press Enter to exit..."

@@ -8,6 +8,7 @@ A lightweight, automated fix for issues with **Automatic Tuning** (GPU auto-over
 1. **Toggle resets or fails to start** (0% stuck / immediately unchecks).
 2. **Stuck slider / Ghost Tuning** (slider shows ON with +0 MHz, cannot be turned off, throws *"Something went wrong"*).
 3. **Scan fails to start when enabling toggle** (throws *"Something went wrong"* due to background OC scan returning NvAPI error `-104` on newer GPUs/drivers like RTX 50-series / 621+).
+4. **Scan immediately turns off upon clicking** (`StartOcManualScan` returns `result: false` due to Session 0 isolation in `_OverClockingNvc.dll`).
 
 ---
 
@@ -32,8 +33,11 @@ Users of NVIDIA App frequently encounter one of these major bugs under **System 
 - Clicking the toggle to turn it **Off** results in a toast error: *"Something went wrong"* (`common.somethingWentWrong`), and the toggle immediately snaps back to **ON**.
 - The "Restore" button is greyed out/disabled.
 
-#### Bug 3: Scan Never Begins When Clicking Toggle ("Something went wrong")
+#### Bug 3: Background Scan Error (`-104`) Blocks Launching Scan
 - When attempting to toggle Automatic Tuning **ON**, the app immediately shows a toast error *"Something went wrong"*, the slider never engages, and the tuning scan never runs.
+
+#### Bug 4: Toggle Does Not React / Snaps Back to OFF Immediately
+- Clicking the toggle produces no error toast, but the switch immediately flips back to **OFF** without starting the scan.
 
 ---
 
@@ -75,30 +79,39 @@ In NVIDIA App 11.0.9, NVIDIA introduced a new native CEF plugin `CEF\plugins\NVI
    ```
 4. This aborts execution before `this.startOcScan()` is ever called, triggers the *"Something went wrong"* popup, and blocks manual OC tuning from starting!
 
+#### Root Cause 4: Session 0 Isolation in `_OverClockingNvc.dll` (`hasAdminConsent`)
+1. When `StartOcManualScan` is called, `_OverClockingNvc.dll` verifies admin consent via `hasAdminConsent()` before launching the scan.
+2. In `NvAppPermissionHelper.cpp`, `hasAdminConsent()` queries the current session:
+   `ProcessIdToSessionId(GetCurrentProcessId(), &sessionId)`
+3. Because `_OverClockingNvc.dll` runs inside `NvContainerLocalSystem` (a Windows System service), it executes in **Session 0**.
+4. In Windows, Session 0 is non-interactive. Calling `WTSQueryUserToken(0)` or looking up the user token in Session 0 fails with `ERROR_NO_TOKEN` (1008).
+5. As a result, `_OverClockingNvc.dll` logs `"We don't have admin consent. Returning false"` and returns `{ "result": false }` to the frontend, even though the interactive user already consented (and `HKLM\SOFTWARE\NVIDIA Corporation\Global\NvApp\OC` contains the user's SID)!
+6. Seeing `result: false`, the UI executes `Auto tuning disabled manually` and snaps the toggle back to OFF.
+
 ---
 
 ### What This Fix Does
 
 1. **Restores Missing Plugin**: Creates the NTFS directory junction `Plugins\localuser\oc` ➔ `Plugins\oc` (with automatic fallback copy).
-2. **Fixes Stuck Slider Logic**: Patches `getAutoTuneToggleState()` to check `(W.stable && W.averageGpuClockOffsetMhz > 0) || 0 === W.type` so the slider only shows ON when real overclock offsets are applied.
-3. **Bypasses Background Scan Failure**:
+2. **Unlocks Backend Admin Consent**: Patches `hasAdminConsent()` in `_OverClockingNvc.dll` (`E9 DB 47 05 00` ➔ `B0 01 C3 90 90`), bypassing the broken Session 0 user token lookup so `StartOcManualScan` succeeds.
+3. **Fixes Stuck Slider Logic**: Patches `getAutoTuneToggleState()` to check `(W.stable && W.averageGpuClockOffsetMhz > 0) || 0 === W.type` so the slider only shows ON when real overclock offsets are applied.
+4. **Bypasses Background Scan Failure**:
    - Patches `enableBackgroundOcScan()` so it never throws on `-104`, correctly managing toggle state for both enable and disable actions.
    - Patches `enableBgOcScanAndStartScan()` to directly call `this.startOcScan()`, ensuring manual OC scanning begins immediately via `_OverClockingNvc`.
-4. **Cleans UI Cache**: Purges CEF browser cache to apply updated frontend code immediately.
-5. **Restarts Services**: Safely restarts `NvContainerLocalSystem` and active NVIDIA App/Overlay processes.
+5. **Cleans UI Cache**: Purges CEF browser cache to apply updated frontend code immediately.
+6. **Restarts Services**: Safely restarts `NvContainerLocalSystem` and active NVIDIA App/Overlay processes.
 
 ---
 
 ### How to Use
 
 #### Method 1: Batch Script (One-Click)
-1. Download [Fix_NVIDIA_App.bat](Fix_NVIDIA_App.bat).
+1. Download [Fix_NVIDIA_App.bat](Fix_NVIDIA_App.bat) and [Fix_NVIDIA_App.ps1](Fix_NVIDIA_App.ps1) to the same directory.
 2. Double-click `Fix_NVIDIA_App.bat` (it will automatically request Administrator privileges).
 3. Follow the on-screen prompts.
 
 #### Method 2: PowerShell
-1. Download [Fix_NVIDIA_App.ps1](Fix_NVIDIA_App.ps1).
-2. Right-click `Fix_NVIDIA_App.ps1` -> **Run with PowerShell** (or run inside an elevated PowerShell terminal):
+1. Right-click `Fix_NVIDIA_App.ps1` -> **Run with PowerShell** (or run inside an elevated PowerShell terminal):
    ```powershell
    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
    .\Fix_NVIDIA_App.ps1
@@ -107,7 +120,7 @@ In NVIDIA App 11.0.9, NVIDIA introduced a new native CEF plugin `CEF\plugins\NVI
 ---
 
 ### Bug Report Status
-All identified bugs, root causes, and frontend call chains have been reported to the NVIDIA engineering team via **NVIDIA App Feedback**. Once NVIDIA updates their installer manifest and UI conditional flow in an official release, this workaround will no longer be necessary.
+All identified bugs, root causes, and frontend call chains have been reported to the NVIDIA engineering team via **NVIDIA App Feedback**. Once NVIDIA updates their installer manifest, UI conditional flow, and Session 0 token lookup in an official release, this workaround will no longer be necessary.
 
 ---
 ---
@@ -131,6 +144,9 @@ All identified bugs, root causes, and frontend call chains have been reported to
 
 #### Баг 3: При включении тумблера сразу ошибка «Что-то пошло не так»
 - При нажатии на тумблер автоматической настройки появляется красное уведомление об ошибке, тумблер остаётся выключенным, и тестирование разгона не запускается.
+
+#### Баг 4: Тумблер не реагирует на нажатие (моментально возвращается в выключенное положение)
+- При нажатии на тумблер ошибки нет, но тумблер тут же отскакивает обратно в положение «Выкл.», и процесс сканирования не запускается.
 
 ---
 
@@ -166,29 +182,37 @@ getAutoTuneToggleState() {
 3. Метод `enableBackgroundOcScan` выбрасывает исключение: `Some error occured in EnableBackgroundOcScan`.
 4. Из-за этого вызов `this.startOcScan()` **даже не вызывается**, интерфейс показывает сообщение *«Что-то пошло не так»*, а тестирование так и не начинается.
 
+#### Причина 4: Изоляция нулевой сессии в `_OverClockingNvc.dll` (`hasAdminConsent`)
+1. При вызове `StartOcManualScan` библиотека `_OverClockingNvc.dll` проверяет согласие администратора через функцию `hasAdminConsent()`.
+2. Код `NvAppPermissionHelper.cpp` пытается определить SID пользователя через вызов `WTSQueryUserToken` для текущей сессии процесса.
+3. Поскольку `nvcontainer.exe` запущен системной службой `NvContainerLocalSystem`, он работает в **Session 0** (служебная изолированная сессия).
+4. В Session 0 нет интерактивного токена пользователя, и вызов завершается ошибкой.
+5. Библиотека выводит в лог `"We don't have admin consent. Returning false"` и возвращает `{ "result": false }`, несмотря на то, что пользователь в Session 1 уже дал согласие, и в реестре `HKLM\SOFTWARE\NVIDIA Corporation\Global\NvApp\OC` записан ключ `SID = 1`!
+6. Интерфейс, получив `result: false`, логирует `Auto tuning disabled manually` и моментально выключает тумблер.
+
 ---
 
 ### Что делает скрипт исправления
 
 1. **Восстанавливает плагин**: Создаёт NTFS-связь (junction) `Plugins\localuser\oc` ➔ `Plugins\oc` (или копирует файлы при запрете связей).
-2. **Исправляет отображение слайдера**: Тумблер горит только если действительно применён разгон `averageGpuClockOffsetMhz > 0`.
-3. **Разблокирует запуск тестирования**:
+2. **Разблокирует проверку прав в бэкенде**: Патчит `hasAdminConsent()` в `_OverClockingNvc.dll` (`E9 DB 47 05 00` ➔ `B0 01 C3 90 90`), обходя сбойную проверку нулевой сессии, благодаря чему `StartOcManualScan` успешно запускает сканирование.
+3. **Исправляет отображение слайдера**: Тумблер горит только если действительно применён разгон `averageGpuClockOffsetMhz > 0`.
+4. **Разблокирует запуск тестирования**:
    - Перехватывает ошибку `-104`, корректно переключая статус без сбоя в ошибку.
    - Напрямую запускает ручной сканер `startOcScan()`, инициируя процесс автоматического поиска частот.
-4. **Очищает кэш UI**: Удаляет кэш CEF для мгновенного применения изменений.
-5. **Перезапускает службы**: Перезапускает службу `NvContainerLocalSystem` и закрывает зависшие процессы `NVIDIA App.exe` и `nvcontainer.exe`.
+5. **Очищает кэш UI**: Удаляет кэш CEF для мгновенного применения изменений.
+6. **Перезапускает службы**: Перезапускает службу `NvContainerLocalSystem` и закрывает зависшие процессы `NVIDIA App.exe` и `nvcontainer.exe`.
 
 ---
 
 ### Инструкция по запуску
 
 #### Вариант 1: Через `.bat` в один клик
-1. Скачайте [Fix_NVIDIA_App.bat](Fix_NVIDIA_App.bat).
-2. Запустите двойным кликом (скрипт автоматически запросит права Администратора).
+1. Скачайте [Fix_NVIDIA_App.bat](Fix_NVIDIA_App.bat) и [Fix_NVIDIA_App.ps1](Fix_NVIDIA_App.ps1) в одну папку.
+2. Запустите `Fix_NVIDIA_App.bat` двойным кликом (скрипт автоматически запросит права Администратора).
 
 #### Вариант 2: Через PowerShell `.ps1`
-1. Скачайте [Fix_NVIDIA_App.ps1](Fix_NVIDIA_App.ps1).
-2. Запустите правой кнопкой мыши -> **Выполнить с помощью PowerShell** (или в терминале от имени Администратора):
+1. Запустите `Fix_NVIDIA_App.ps1` правой кнопкой мыши -> **Выполнить с помощью PowerShell** (или в терминале от имени Администратора):
    ```powershell
    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
    .\Fix_NVIDIA_App.ps1
