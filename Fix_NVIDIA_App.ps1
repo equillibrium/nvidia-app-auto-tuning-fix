@@ -133,7 +133,7 @@ foreach ($dllPath in $dllLocations) {
                 }
             }
         } catch {
-            Write-Host "  [!] Could not patch $dllPath: $_" -ForegroundColor Yellow
+            Write-Host "  [!] Could not patch $($dllPath): $_" -ForegroundColor Yellow
         }
     }
 }
