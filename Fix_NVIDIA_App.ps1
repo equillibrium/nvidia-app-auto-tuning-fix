@@ -1,7 +1,8 @@
 ﻿# NVIDIA App Automatic Tuning Fix
 # Fixes:
 # 1. Missing overclocking plugin in NvContainer (junction link Plugins\localuser\oc -> Plugins\oc).
-# 2. NVIDIA App 11.0.9+ stuck slider bug (slider shows ON with +0 MHz, fails to turn OFF with "Something went wrong").
+# 2. NVIDIA App 11.0.9+ stuck slider bug (slider shows ON with +0 MHz on launch).
+# 3. NVIDIA App 11.0.9+ / Driver 621+ error on enabling scan ("Something went wrong" / NVAPI error -104 on background OC scan).
 # Requires Administrator privileges.
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -62,9 +63,9 @@ if (Test-Path $ocDir) {
     Write-Host "  [!] Directory '$ocDir' not found, skipping junction creation." -ForegroundColor Yellow
 }
 
-# --- Step 2: Fixing stuck slider / ghost tuning bug in UI ---
+# --- Step 2: Fixing stuck slider & scan launch bugs in UI ---
 Write-Host ""
-Write-Host "[2/4] Checking for NVIDIA App 11.0.9+ stuck slider bug..." -ForegroundColor Green
+Write-Host "[2/4] Checking and patching NVIDIA App UI logic..." -ForegroundColor Green
 $patchedAny = $false
 if (Test-Path $wwwDir) {
     $mainJsFiles = Get-ChildItem -Path $wwwDir -Filter "main.*.js" -File
@@ -73,15 +74,22 @@ if (Test-Path $wwwDir) {
             $content = [System.IO.File]::ReadAllText($js.FullName)
             $needsPatch = $false
 
-            # Target 1: getAutoTuneToggleState() checks W.stable without checking offset > 0
+            # Patch 1: getAutoTuneToggleState() checks W.stable without checking offset > 0
             $t1 = 'W=>W.stable||0===W.type'
             $r1 = 'W=>(W.stable&&W.averageGpuClockOffsetMhz>0)||0===W.type'
 
-            # Target 2: enableBackgroundOcScan throws error on disable if driver returns -104
-            $t2 = 'automaticTuningEnabled=K.enable?p.T8.TRUE:p.T8.FALSE,B.result)'
-            $r2 = 'automaticTuningEnabled=K.enable?p.T8.TRUE:p.T8.FALSE,B.result||!K.enable)'
+            # Patch 2: enableBackgroundOcScan throws error on driver NVAPI -104 (unsupported bg scan)
+            $t2_1 = 'automaticTuningEnabled=K.enable?p.T8.TRUE:p.T8.FALSE,B.result||!K.enable)'
+            $t2_2 = 'automaticTuningEnabled=K.enable?p.T8.TRUE:p.T8.FALSE,B.result)'
+            $r2   = 'automaticTuningEnabled=K.enable?p.T8.TRUE:p.T8.FALSE,!0)'
 
-            if ($content.Contains($t1) -or $content.Contains($t2)) {
+            # Patch 3: enableBgOcScanAndStartScan directly triggers startOcScan() without waiting/failing on background oc scan
+            $t3 = 'W=>W?this.startOcScan():(this.logger.error("Background Oc scan not enabled, Not starting Oc scan"),(0,s.of)(!1))'
+            $r3 = '()=>this.startOcScan()'
+
+            $fileNeedsUpdate = $content.Contains($t1) -or $content.Contains($t2_1) -or $content.Contains($t2_2) -or $content.Contains($t3)
+
+            if ($fileNeedsUpdate) {
                 $bakFile = "$($js.FullName).bak"
                 if (-not (Test-Path $bakFile)) {
                     Copy-Item -Path $js.FullName -Destination $bakFile -Force
@@ -92,18 +100,26 @@ if (Test-Path $wwwDir) {
                     $content = $content.Replace($t1, $r1)
                     $needsPatch = $true
                 }
-                if ($content.Contains($t2)) {
-                    $content = $content.Replace($t2, $r2)
+                if ($content.Contains($t2_1)) {
+                    $content = $content.Replace($t2_1, $r2)
+                    $needsPatch = $true
+                }
+                if ($content.Contains($t2_2)) {
+                    $content = $content.Replace($t2_2, $r2)
+                    $needsPatch = $true
+                }
+                if ($content.Contains($t3)) {
+                    $content = $content.Replace($t3, $r3)
                     $needsPatch = $true
                 }
 
                 if ($needsPatch) {
                     [System.IO.File]::WriteAllText($js.FullName, $content, [System.Text.Encoding]::UTF8)
-                    Write-Host "  [+] Patched UI toggle logic in $($js.Name)" -ForegroundColor Green
+                    Write-Host "  [+] Patched UI logic in $($js.Name)" -ForegroundColor Green
                     $patchedAny = $true
                 }
             } else {
-                Write-Host "  [+] UI toggle logic in $($js.Name) is already clean/up-to-date." -ForegroundColor Green
+                Write-Host "  [+] UI logic in $($js.Name) is already clean and fully patched." -ForegroundColor Green
             }
         } catch {
             Write-Host "  [!] Could not patch $($js.Name): $_" -ForegroundColor Yellow
@@ -114,26 +130,21 @@ if (Test-Path $wwwDir) {
 }
 
 # --- Step 3: Clean up cache if patched ---
-if ($patchedAny) {
-    Write-Host ""
-    Write-Host "[3/4] Cleaning NVIDIA App UI cache..." -ForegroundColor Green
-    $cacheDirs = @(
-        "$env:LOCALAPPDATA\NVIDIA Corporation\NVIDIA App\CefCache",
-        "$env:LOCALAPPDATA\NVIDIA Corporation\NVIDIA Overlay\CefCache"
-    )
-    foreach ($cDir in $cacheDirs) {
-        if (Test-Path $cDir) {
-            try {
-                Remove-Item -Path "$cDir\Cache\*" -Recurse -Force -ErrorAction SilentlyContinue
-                Write-Host "  [+] Cleared cache: $cDir\Cache" -ForegroundColor Green
-            } catch {
-                # Non-fatal if locked
-            }
+Write-Host ""
+Write-Host "[3/4] Cleaning NVIDIA App UI cache..." -ForegroundColor Green
+$cacheDirs = @(
+    "$env:LOCALAPPDATA\NVIDIA Corporation\NVIDIA App\CefCache",
+    "$env:LOCALAPPDATA\NVIDIA Corporation\NVIDIA Overlay\CefCache"
+)
+foreach ($cDir in $cacheDirs) {
+    if (Test-Path $cDir) {
+        try {
+            Remove-Item -Path "$cDir\Cache\*" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "  [+] Cleared cache: $cDir\Cache" -ForegroundColor Green
+        } catch {
+            # Non-fatal if locked
         }
     }
-} else {
-    Write-Host ""
-    Write-Host "[3/4] UI cache clean-up skipped." -ForegroundColor Green
 }
 
 # --- Step 4: Restart NVIDIA services and processes ---
@@ -159,8 +170,11 @@ Write-Host "=========================================================" -Foregrou
 Write-Host "RESULTS:" -ForegroundColor Yellow
 Write-Host "1. Overclocking plugin linked to NvContainer."
 Write-Host "2. Stuck slider bug fixed: Automatic Tuning toggle will no longer"
-Write-Host "   falsely show ON at 0 MHz, and can be toggled without errors."
-Write-Host "3. Launch NVIDIA App -> System -> Performance to verify."
+Write-Host "   falsely show ON at +0 MHz."
+Write-Host "3. Tuning scan start bug fixed: clicking the toggle will now"
+Write-Host "   properly launch the manual OC scanner instead of showing"
+Write-Host "   'Something went wrong' / error -104."
+Write-Host "4. Launch NVIDIA App -> System -> Performance to start tuning."
 Write-Host "=========================================================" -ForegroundColor Cyan
 Write-Host ""
 Read-Host "Press Enter to exit..."

@@ -7,6 +7,7 @@
 A lightweight, automated fix for issues with **Automatic Tuning** (GPU auto-overclocking) in **NVIDIA App**:
 1. **Toggle resets or fails to start** (0% stuck / immediately unchecks).
 2. **Stuck slider / Ghost Tuning** (slider shows ON with +0 MHz, cannot be turned off, throws *"Something went wrong"*).
+3. **Scan fails to start when enabling toggle** (throws *"Something went wrong"* due to background OC scan returning NvAPI error `-104` on newer GPUs/drivers like RTX 50-series / 621+).
 
 ---
 
@@ -19,9 +20,9 @@ A lightweight, automated fix for issues with **Automatic Tuning** (GPU auto-over
 
 ### Problem Description
 
-Users of NVIDIA App frequently encounter one of two major bugs under **System -> Performance -> Automatic Tuning**:
+Users of NVIDIA App frequently encounter one of these major bugs under **System -> Performance -> Automatic Tuning**:
 
-#### Bug 1: Toggle Immediately Turns Off / Scan Never Starts
+#### Bug 1: Missing Plugin / Scan Never Starts
 - When you toggle **Automatic Tuning** ON, nothing happens (progress remains at 0% or scan never starts).
 - Switching to another tab and coming back resets the toggle to **Off**.
 - Client logs show `completionStatus: 34` and timeouts/missing message handlers on the NVIDIA MessageBus.
@@ -31,18 +32,21 @@ Users of NVIDIA App frequently encounter one of two major bugs under **System ->
 - Clicking the toggle to turn it **Off** results in a toast error: *"Something went wrong"* (`common.somethingWentWrong`), and the toggle immediately snaps back to **ON**.
 - The "Restore" button is greyed out/disabled.
 
+#### Bug 3: Scan Never Begins When Clicking Toggle ("Something went wrong")
+- When attempting to toggle Automatic Tuning **ON**, the app immediately shows a toast error *"Something went wrong"*, the slider never engages, and the tuning scan never runs.
+
 ---
 
 ### Technical Root Cause Analysis
 
-#### Root Cause of Bug 1: Missing Plugin Junction
+#### Root Cause 1: Missing Plugin Junction in NvContainer
 - NVIDIA App delegates background GPU management to `nvcontainer.exe`.
 - The container discovers plugins via `%ProgramFiles%\NVIDIA Corporation\NvContainer\plugins\User\NVIDIA App`, which points to `Plugins\localuser`.
 - The overclocking plugin (`_OverClockingNvc.dll`) is placed by the installer into `Plugins\oc`.
 - In the installer manifest (`NvApp.nvi`), NVIDIA configured junctions for most plugins (desktop, systeminfo, updater, etc.), but **omitted creating a junction for `oc`**.
 - As a result, `nvcontainer.exe` never loads `_OverClockingNvc.dll` into memory, causing any `EnableBackgroundOcScan` call to fail silently.
 
-#### Root Cause of Bug 2: Frontend State Logic Flaw & NvAPI `-104` Error
+#### Root Cause 2: Frontend State Logic Flaw
 In NVIDIA App 11.0.9, NVIDIA introduced a new native CEF plugin `CEF\plugins\NVIDIA App\NvOc.dll` and updated the frontend UI logic:
 1. When the performance page loads, the frontend calls `getAutoTuneToggleState()` in `www\main.*.js`:
    ```javascript
@@ -54,20 +58,34 @@ In NVIDIA App 11.0.9, NVIDIA introduced a new native CEF plugin `CEF\plugins\NVI
    ```
 2. When no scan has ever succeeded, NvAPI returns `completionStatus: 34`, `averageGpuClockOffsetMhz: 0`, and `stable: 1` (indicating stock clocks are stable).
 3. Because `W.stable` is `1` (truthy in JavaScript), the UI concludes that Automatic Tuning is **enabled**, rendering the toggle as **ON** despite +0 MHz offset!
-4. When the user clicks the toggle to turn it OFF, the app calls `EnableBackgroundOcScan({ enable: false })`.
-5. On modern architectures (such as RTX 50-series / Blackwell) and newer drivers (e.g., 621.14), NvAPI returns `-104 (NVAPI_NOT_SUPPORTED)`.
-6. The UI catches this error, shows the *"Something went wrong"* popup, and executes `this.tuningToggleRef().checked = this.autoTunerToggleState`, forcing the toggle back to **ON**!
+
+#### Root Cause 3: Background OC Scan Call Failing on Newer Drivers/GPUs (NvAPI `-104`)
+1. In `www\main.*.js`, starting a tuning scan calls:
+   ```javascript
+   enableBgOcScanAndStartScan() {
+       return this.enableBackgroundOcScan(!0).pipe(
+           (0, S.n)(W => W ? this.startOcScan() : (this.logger.error("..."), (0, s.of)(!1)))
+       );
+   }
+   ```
+2. On RTX 50-series (Blackwell) and newer drivers (such as 621.14), `NvAPI_GPU_ClientEnableBackgroundOcScanner` returns `-104 (NVAPI_NOT_SUPPORTED)`.
+3. Because `enableBackgroundOcScan(!0)` requires driver background scanning to succeed, it throws an error:
+   ```
+   ERROR nvapp/PerfTuningService Some error occured in EnableBackgroundOcScan [object Object]
+   ```
+4. This aborts execution before `this.startOcScan()` is ever called, triggers the *"Something went wrong"* popup, and blocks manual OC tuning from starting!
 
 ---
 
 ### What This Fix Does
 
 1. **Restores Missing Plugin**: Creates the NTFS directory junction `Plugins\localuser\oc` ➔ `Plugins\oc` (with automatic fallback copy).
-2. **Fixes Stuck Slider Logic**: Patches `www\main.*.js` (with automatic `.bak` backup):
-   - Corrects `getAutoTuneToggleState()` to check `(W.stable && W.averageGpuClockOffsetMhz > 0) || 0 === W.type` so the slider only shows ON when real overclock offsets are applied.
-   - Updates `enableBackgroundOcScan()` to treat disabling as successful even if the driver returns `-104`, allowing the user to cleanly turn off Automatic Tuning without errors.
-3. **Cleans UI Cache**: Purges CEF browser cache to apply updated frontend code immediately.
-4. **Restarts Services**: Safely restarts `NvContainerLocalSystem` and active NVIDIA App/Overlay processes.
+2. **Fixes Stuck Slider Logic**: Patches `getAutoTuneToggleState()` to check `(W.stable && W.averageGpuClockOffsetMhz > 0) || 0 === W.type` so the slider only shows ON when real overclock offsets are applied.
+3. **Bypasses Background Scan Failure**:
+   - Patches `enableBackgroundOcScan()` so it never throws on `-104`, correctly managing toggle state for both enable and disable actions.
+   - Patches `enableBgOcScanAndStartScan()` to directly call `this.startOcScan()`, ensuring manual OC scanning begins immediately via `_OverClockingNvc`.
+4. **Cleans UI Cache**: Purges CEF browser cache to apply updated frontend code immediately.
+5. **Restarts Services**: Safely restarts `NvContainerLocalSystem` and active NVIDIA App/Overlay processes.
 
 ---
 
@@ -89,7 +107,7 @@ In NVIDIA App 11.0.9, NVIDIA introduced a new native CEF plugin `CEF\plugins\NVI
 ---
 
 ### Bug Report Status
-Both bugs and their exact lines of failure have been reported to the NVIDIA engineering team via **NVIDIA App Feedback**. Once NVIDIA resolves the installer manifest and UI conditional check in an official update, this fix will no longer be necessary.
+All identified bugs, root causes, and frontend call chains have been reported to the NVIDIA engineering team via **NVIDIA App Feedback**. Once NVIDIA updates their installer manifest and UI conditional flow in an official release, this workaround will no longer be necessary.
 
 ---
 ---
@@ -99,7 +117,7 @@ Both bugs and their exact lines of failure have been reported to the NVIDIA engi
 
 ### Описание проблемы
 
-Пользователи NVIDIA App часто сталкиваются с одной из двух проблем во вкладке **Система -> Производительность -> Автоматическая настройка**:
+Пользователи NVIDIA App часто сталкиваются со следующими проблемами во вкладке **Система -> Производительность -> Автоматическая настройка**:
 
 #### Баг 1: Тумблер сразу выключается / разгон не начинается
 - При включении тумблера «Автоматическая настройка» ничего не происходит (прогресс висит на 0% или сканирование сбрасывается).
@@ -111,42 +129,54 @@ Both bugs and their exact lines of failure have been reported to the NVIDIA engi
 - При попытке нажать на тумблер и выключить его появляется ошибка: *«Что-то пошло не так»* (`common.somethingWentWrong`), и тумблер моментально возвращается во **включённое** состояние.
 - Кнопка «Восстановить» неактивна (серая).
 
+#### Баг 3: При включении тумблера сразу ошибка «Что-то пошло не так»
+- При нажатии на тумблер автоматической настройки появляется красное уведомление об ошибке, тумблер остаётся выключенным, и тестирование разгона не запускается.
+
 ---
 
 ### Технический разбор причин
 
-#### Причина бага 1: Пропущенный плагин в инсталляторе
+#### Причина 1: Пропущенный плагин в инсталляторе
 - Фоновый контейнер `nvcontainer.exe` загружает пользовательские плагины из `Plugins\localuser`.
 - Библиотека оверклокинга (`_OverClockingNvc.dll`) устанавливается инсталлятором в `Plugins\oc`.
-- В файле манифеста инсталлятора (`NvApp.nvi`) созданы ссылки для всех базовых модулей, но **разработчики забыли добавить создание ссылки для папки `oc`**.
-- Контейнер не загружает библиотеку в память, и вызовы `EnableBackgroundOcScan` падают.
+- В манифесте инсталлятора (`NvApp.nvi`) созданы ссылки для всех базовых модулей, но **разработчики забыли добавить создание ссылки для папки `oc`**.
+- Контейнер не загружает библиотеку в память, и вызовы падают.
 
-#### Причина бага 2: Ошибка в логике фронтенда и код `-104` от NvAPI
-В обновлении NVIDIA App 11.0.9 появился нативный плагин `CEF\plugins\NVIDIA App\NvOc.dll` и обновился фронтенд:
-1. При загрузке страницы статус тумблера запрашивается через `getAutoTuneToggleState()` в `www\main.*.js`:
+#### Причина 2: Ошибка проверки статуса в интерфейсе
+В NVIDIA App 11.0.9 обновился код проверки состояния:
+```javascript
+getAutoTuneToggleState() {
+    return this.scanResultNotification$.pipe(
+        (0, c.T)(W => W.stable || 0 === W.type)
+    );
+}
+```
+Если разгон ещё не проводился, драйвер возвращает `averageGpuClockOffsetMhz: 0`, но флаг `stable: 1`. Фронтенд видит truthy значение и ошибочно зажигает слайдер при +0 МГц.
+
+#### Причина 3: Блокировка фоновым сканированием (код `-104`)
+1. Для запуска разгона интерфейс вызывает цепочку:
    ```javascript
-   getAutoTuneToggleState() {
-       return this.scanResultNotification$.pipe(
-           (0, c.T)(W => W.stable || 0 === W.type)
+   enableBgOcScanAndStartScan() {
+       return this.enableBackgroundOcScan(!0).pipe(
+           (0, S.n)(W => W ? this.startOcScan() : ...)
        );
    }
    ```
-2. Если сканирование не завершилось успехом, драйвер возвращает `completionStatus: 34`, смещение `+0 МГц`, но флаг `stable: 1` (базовые частоты стабильны).
-3. Так как `W.stable` равен `1` (truthy), интерфейс ошибочно решает, что автоматическая настройка **включена**, и зажигает тумблер при +0 МГц!
-4. Когда пользователь кликает по тумблеру для выключения, приложение вызывает `EnableBackgroundOcScan({ enable: false })`.
-5. На видеокартах нового поколения (например, RTX 50-серии / Blackwell) и свежих драйверах (621.xx) драйвер возвращает `-104 (NVAPI_NOT_SUPPORTED)`.
-6. Обработчик ошибок перехватывает этот код, показывает всплывающее окно *«Что-то пошло не так»* и возвращает тумблер в исходное состояние `checked = true`. Тумблер оказывается заблокирован.
+2. На архитектуре Blackwell (RTX 50-серия) и свежих драйверах (621.xx) вызов фонового сканирования возвращает `-104 (NVAPI_NOT_SUPPORTED)`.
+3. Метод `enableBackgroundOcScan` выбрасывает исключение: `Some error occured in EnableBackgroundOcScan`.
+4. Из-за этого вызов `this.startOcScan()` **даже не вызывается**, интерфейс показывает сообщение *«Что-то пошло не так»*, а тестирование так и не начинается.
 
 ---
 
 ### Что делает скрипт исправления
 
 1. **Восстанавливает плагин**: Создаёт NTFS-связь (junction) `Plugins\localuser\oc` ➔ `Plugins\oc` (или копирует файлы при запрете связей).
-2. **Исправляет логику интерфейса**: Патчит `www\main.*.js` (с созданием резервной копии `.bak`):
-   - Исправляет проверку статуса: тумблер зажигается только при реальном разгоне `averageGpuClockOffsetMhz > 0`.
-   - Разрешает отключение тумблера без падения в ошибку, если драйвер вернул `-104`.
-3. **Очищает кэш UI**: Удаляет кэш CEF для мгновенного применения обновлённого скрипта.
-4. **Перезапускает службы**: Перезапускает службу `NvContainerLocalSystem` и закрывает зависшие процессы `NVIDIA App.exe` и `nvcontainer.exe`.
+2. **Исправляет отображение слайдера**: Тумблер горит только если действительно применён разгон `averageGpuClockOffsetMhz > 0`.
+3. **Разблокирует запуск тестирования**:
+   - Перехватывает ошибку `-104`, корректно переключая статус без сбоя в ошибку.
+   - Напрямую запускает ручной сканер `startOcScan()`, инициируя процесс автоматического поиска частот.
+4. **Очищает кэш UI**: Удаляет кэш CEF для мгновенного применения изменений.
+5. **Перезапускает службы**: Перезапускает службу `NvContainerLocalSystem` и закрывает зависшие процессы `NVIDIA App.exe` и `nvcontainer.exe`.
 
 ---
 
