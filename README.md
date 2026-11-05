@@ -4,7 +4,9 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20(64--bit)-lightgrey.svg)]()
 [![Tested with NVIDIA App](https://img.shields.io/badge/NVIDIA%20App-v11.0.9%2B-green.svg)]()
 
-A lightweight, automated fix for the bug in **NVIDIA App** where the **Automatic Tuning** (GPU auto-overclocking) feature fails to start, immediately reverts to disabled, or does nothing when toggled.
+A lightweight, automated fix for issues with **Automatic Tuning** (GPU auto-overclocking) in **NVIDIA App**:
+1. **Toggle resets or fails to start** (0% stuck / immediately unchecks).
+2. **Stuck slider / Ghost Tuning** (slider shows ON with +0 MHz, cannot be turned off, throws *"Something went wrong"*).
 
 ---
 
@@ -16,47 +18,56 @@ A lightweight, automated fix for the bug in **NVIDIA App** where the **Automatic
 ## English
 
 ### Problem Description
-In **NVIDIA App** under **System -> Performance**, clicking the toggle for **Automatic Tuning**:
-1. Briefly checks the toggle, but scanning never begins (progress remains stuck at 0% or does not start).
-2. If you switch to another tab and come back, the **Automatic Tuning** toggle is automatically turned back **Off**.
-3. In client logs (`%LOCALAPPDATA%\NVIDIA Corporation\NVIDIA App\data\logs\client.log`), you find:
-   ```json
-   "payload": {
-     "completionStatus": 34,
-     "confidence": 0,
-     "errorType": 1,
-     "isTuningProgressRunning": false,
-     "lastTestedClocks": 0,
-     "percentCompleted": 0
-   }
-   ```
-   and requests to `EnableBackgroundOcScan` fail or time out on the NVIDIA MessageBus.
+
+Users of NVIDIA App frequently encounter one of two major bugs under **System -> Performance -> Automatic Tuning**:
+
+#### Bug 1: Toggle Immediately Turns Off / Scan Never Starts
+- When you toggle **Automatic Tuning** ON, nothing happens (progress remains at 0% or scan never starts).
+- Switching to another tab and coming back resets the toggle to **Off**.
+- Client logs show `completionStatus: 34` and timeouts/missing message handlers on the NVIDIA MessageBus.
+
+#### Bug 2: Stuck Slider ON (+0 MHz) and Cannot Be Turned Off (v11.0.9+)
+- After app or driver updates, the **Automatic Tuning** toggle appears permanently **ON**, but the GPU clock offset is **+0 MHz** (no overclock is active).
+- Clicking the toggle to turn it **Off** results in a toast error: *"Something went wrong"* (`common.somethingWentWrong`), and the toggle immediately snaps back to **ON**.
+- The "Restore" button is greyed out/disabled.
 
 ---
 
-### Root Cause Analysis
-During an in-depth diagnosis of the NVIDIA App installation:
-- NVIDIA App delegates background hardware management tasks to `nvcontainer.exe`.
-- The user-session container looks for plugins in:
-  `%ProgramFiles%\NVIDIA Corporation\NvContainer\plugins\User\NVIDIA App`
-  which is an NTFS directory junction pointing to:
-  `%ProgramFiles%\NVIDIA Corporation\NVIDIA App\Plugins\localuser`
-- The overclocking plugin (`_OverClockingNvc.dll`) is placed by the installer into:
-  `%ProgramFiles%\NVIDIA Corporation\NVIDIA App\Plugins\oc`
-- **The Bug**: In the NVIDIA installer manifest (`NvApp.nvi`), NVIDIA created directory junctions linking various plugins into `Plugins\localuser` (such as `desktop`, `systeminfo`, `updater`, `downloader`, etc.), but **omitted creating a junction for `oc`**.
-- Because this junction is missing, `nvcontainer.exe` never discovers or loads `_OverClockingNvc.dll` into its process memory.
-- When the UI sends an `EnableBackgroundOcScan` request, there is no handler listening on the bus, causing the operation to fail immediately with `completionStatus: 34`.
+### Technical Root Cause Analysis
+
+#### Root Cause of Bug 1: Missing Plugin Junction
+- NVIDIA App delegates background GPU management to `nvcontainer.exe`.
+- The container discovers plugins via `%ProgramFiles%\NVIDIA Corporation\NvContainer\plugins\User\NVIDIA App`, which points to `Plugins\localuser`.
+- The overclocking plugin (`_OverClockingNvc.dll`) is placed by the installer into `Plugins\oc`.
+- In the installer manifest (`NvApp.nvi`), NVIDIA configured junctions for most plugins (desktop, systeminfo, updater, etc.), but **omitted creating a junction for `oc`**.
+- As a result, `nvcontainer.exe` never loads `_OverClockingNvc.dll` into memory, causing any `EnableBackgroundOcScan` call to fail silently.
+
+#### Root Cause of Bug 2: Frontend State Logic Flaw & NvAPI `-104` Error
+In NVIDIA App 11.0.9, NVIDIA introduced a new native CEF plugin `CEF\plugins\NVIDIA App\NvOc.dll` and updated the frontend UI logic:
+1. When the performance page loads, the frontend calls `getAutoTuneToggleState()` in `www\main.*.js`:
+   ```javascript
+   getAutoTuneToggleState() {
+       return this.scanResultNotification$.pipe(
+           (0, c.T)(W => W.stable || 0 === W.type)
+       );
+   }
+   ```
+2. When no scan has ever succeeded, NvAPI returns `completionStatus: 34`, `averageGpuClockOffsetMhz: 0`, and `stable: 1` (indicating stock clocks are stable).
+3. Because `W.stable` is `1` (truthy in JavaScript), the UI concludes that Automatic Tuning is **enabled**, rendering the toggle as **ON** despite +0 MHz offset!
+4. When the user clicks the toggle to turn it OFF, the app calls `EnableBackgroundOcScan({ enable: false })`.
+5. On modern architectures (such as RTX 50-series / Blackwell) and newer drivers (e.g., 621.14), NvAPI returns `-104 (NVAPI_NOT_SUPPORTED)`.
+6. The UI catches this error, shows the *"Something went wrong"* popup, and executes `this.tuningToggleRef().checked = this.autoTunerToggleState`, forcing the toggle back to **ON**!
 
 ---
 
 ### What This Fix Does
-1. Automatically creates the missing NTFS directory junction:
-   - **Source**: `%ProgramFiles%\NVIDIA Corporation\NVIDIA App\Plugins\localuser\oc`
-   - **Target**: `%ProgramFiles%\NVIDIA Corporation\NVIDIA App\Plugins\oc`
-   *(Falls back to copying the plugin files if junctions cannot be created).*
-2. Gracefully restarts the `NvContainerLocalSystem` service and refreshes user-space `nvcontainer.exe` processes.
-3. Upon restart, `nvcontainer.exe` discovers the newly linked `oc` plugin and loads `_OverClockingNvc.dll`.
-4. Automatic Tuning is then fully operational!
+
+1. **Restores Missing Plugin**: Creates the NTFS directory junction `Plugins\localuser\oc` ➔ `Plugins\oc` (with automatic fallback copy).
+2. **Fixes Stuck Slider Logic**: Patches `www\main.*.js` (with automatic `.bak` backup):
+   - Corrects `getAutoTuneToggleState()` to check `(W.stable && W.averageGpuClockOffsetMhz > 0) || 0 === W.type` so the slider only shows ON when real overclock offsets are applied.
+   - Updates `enableBackgroundOcScan()` to treat disabling as successful even if the driver returns `-104`, allowing the user to cleanly turn off Automatic Tuning without errors.
+3. **Cleans UI Cache**: Purges CEF browser cache to apply updated frontend code immediately.
+4. **Restarts Services**: Safely restarts `NvContainerLocalSystem` and active NVIDIA App/Overlay processes.
 
 ---
 
@@ -65,7 +76,7 @@ During an in-depth diagnosis of the NVIDIA App installation:
 #### Method 1: Batch Script (One-Click)
 1. Download [Fix_NVIDIA_App.bat](Fix_NVIDIA_App.bat).
 2. Double-click `Fix_NVIDIA_App.bat` (it will automatically request Administrator privileges).
-3. Follow the on-screen instructions.
+3. Follow the on-screen prompts.
 
 #### Method 2: PowerShell
 1. Download [Fix_NVIDIA_App.ps1](Fix_NVIDIA_App.ps1).
@@ -75,28 +86,10 @@ During an in-depth diagnosis of the NVIDIA App installation:
    .\Fix_NVIDIA_App.ps1
    ```
 
-#### Method 3: Manual Execution (Elevated Command Prompt)
-Run the following commands in **Command Prompt (Run as Administrator)**:
-```cmd
-mklink /J "%ProgramFiles%\NVIDIA Corporation\NVIDIA App\Plugins\localuser\oc" "%ProgramFiles%\NVIDIA Corporation\NVIDIA App\Plugins\oc"
-net stop NvContainerLocalSystem
-net start NvContainerLocalSystem
-taskkill /f /im nvcontainer.exe /fi "SESSION ne 0"
-taskkill /f /im "NVIDIA App.exe"
-```
-
----
-
-### Tips for Successful Automatic Tuning Scan
-Once the fix is applied, keep in mind:
-- **Idle GPU required**: Close any games, 3D software, hardware-accelerated browsers, or Discord before starting the scan. If the GPU clock is under active load, the test will abort.
-- **Duration**: The tuning scan runs an algorithmic frequency-voltage curve test and typically takes **10 to 20 minutes**.
-- **Display stability**: Minor screen flickering or brief driver resets during the scan are completely normal as the scanner probes the maximum stable voltage/frequency offsets.
-
 ---
 
 ### Bug Report Status
-This bug and its technical root cause have been documented and reported to the NVIDIA engineering team via the **NVIDIA App Feedback** system. Once NVIDIA resolves the missing junction in a future app installer update (`NvApp.nvi`), this manual fix will no longer be required.
+Both bugs and their exact lines of failure have been reported to the NVIDIA engineering team via **NVIDIA App Feedback**. Once NVIDIA resolves the installer manifest and UI conditional check in an official update, this fix will no longer be necessary.
 
 ---
 ---
@@ -105,84 +98,73 @@ This bug and its technical root cause have been documented and reported to the N
 ## Русский
 
 ### Описание проблемы
-В **NVIDIA App** на вкладке **Система -> Производительность** при попытке включить тумблер **«Автоматическая настройка»**:
-1. Галочка включается на доли секунды, но процесс сканирования и тестирования разгона не начинается.
-2. При переходе на любую другую вкладку и возвращении обратно тумблер снова сбрасывается в выключенное состояние.
-3. В системных логах клиента (`%LOCALAPPDATA%\NVIDIA Corporation\NVIDIA App\data\logs\client.log`) фиксируются ошибки вида:
-   ```json
-   "payload": {
-     "completionStatus": 34,
-     "confidence": 0,
-     "errorType": 1,
-     "isTuningProgressRunning": false,
-     "percentCompleted": 0
+
+Пользователи NVIDIA App часто сталкиваются с одной из двух проблем во вкладке **Система -> Производительность -> Автоматическая настройка**:
+
+#### Баг 1: Тумблер сразу выключается / разгон не начинается
+- При включении тумблера «Автоматическая настройка» ничего не происходит (прогресс висит на 0% или сканирование сбрасывается).
+- При переходе на другую вкладку и возвращении тумблер снова выключен.
+- В системных логах клиента фиксируются ошибки с кодом `completionStatus: 34`.
+
+#### Баг 2: Слайдер залип во включённом состоянии (+0 МГц) и не выключается (v11.0.9+)
+- После обновления драйвера или NVIDIA App тумблер горит **включённым**, но частота разгона равна **+0 МГц** (разгон фактически не работает).
+- При попытке нажать на тумблер и выключить его появляется ошибка: *«Что-то пошло не так»* (`common.somethingWentWrong`), и тумблер моментально возвращается во **включённое** состояние.
+- Кнопка «Восстановить» неактивна (серая).
+
+---
+
+### Технический разбор причин
+
+#### Причина бага 1: Пропущенный плагин в инсталляторе
+- Фоновый контейнер `nvcontainer.exe` загружает пользовательские плагины из `Plugins\localuser`.
+- Библиотека оверклокинга (`_OverClockingNvc.dll`) устанавливается инсталлятором в `Plugins\oc`.
+- В файле манифеста инсталлятора (`NvApp.nvi`) созданы ссылки для всех базовых модулей, но **разработчики забыли добавить создание ссылки для папки `oc`**.
+- Контейнер не загружает библиотеку в память, и вызовы `EnableBackgroundOcScan` падают.
+
+#### Причина бага 2: Ошибка в логике фронтенда и код `-104` от NvAPI
+В обновлении NVIDIA App 11.0.9 появился нативный плагин `CEF\plugins\NVIDIA App\NvOc.dll` и обновился фронтенд:
+1. При загрузке страницы статус тумблера запрашивается через `getAutoTuneToggleState()` в `www\main.*.js`:
+   ```javascript
+   getAutoTuneToggleState() {
+       return this.scanResultNotification$.pipe(
+           (0, c.T)(W => W.stable || 0 === W.type)
+       );
    }
    ```
-   а вызовы `EnableBackgroundOcScan` завершаются с кодом ошибки (таймаут шины MessageBus).
+2. Если сканирование не завершилось успехом, драйвер возвращает `completionStatus: 34`, смещение `+0 МГц`, но флаг `stable: 1` (базовые частоты стабильны).
+3. Так как `W.stable` равен `1` (truthy), интерфейс ошибочно решает, что автоматическая настройка **включена**, и зажигает тумблер при +0 МГц!
+4. Когда пользователь кликает по тумблеру для выключения, приложение вызывает `EnableBackgroundOcScan({ enable: false })`.
+5. На видеокартах нового поколения (например, RTX 50-серии / Blackwell) и свежих драйверах (621.xx) драйвер возвращает `-104 (NVAPI_NOT_SUPPORTED)`.
+6. Обработчик ошибок перехватывает этот код, показывает всплывающее окно *«Что-то пошло не так»* и возвращает тумблер в исходное состояние `checked = true`. Тумблер оказывается заблокирован.
 
 ---
 
-### В чём заключается баг (Технический анализ)
-- NVIDIA App использует фоновый сервис `nvcontainer.exe` для исполнения модулей управления видеокартой.
-- Пользовательский контейнер загружает плагины из каталога:
-  `%ProgramFiles%\NVIDIA Corporation\NvContainer\plugins\User\NVIDIA App`
-  который является символьной связью (junction) на:
-  `%ProgramFiles%\NVIDIA Corporation\NVIDIA App\Plugins\localuser`
-- Файлы библиотеки оверклокинга (`_OverClockingNvc.dll`) устанавливаются инсталлятором в:
-  `%ProgramFiles%\NVIDIA Corporation\NVIDIA App\Plugins\oc`
-- **Суть бага**: В установочном манифесте NVIDIA (`NvApp.nvi`) прописано создание ссылок в `Plugins\localuser` для всех модулей (`desktop`, `systeminfo`, `updater`, `downloader` и др.), но **разработчики забыли добавить создание ссылки для папки `oc`**.
-- В результате `nvcontainer.exe` просто не знает о существовании `_OverClockingNvc.dll` и не загружает библиотеку в память.
-- Интерфейс пытается запустить сканирование, но фоновый модуль отсутствует, из-за чего статус мгновенно сбрасывается на `completionStatus: 34`.
+### Что делает скрипт исправления
 
----
-
-### Что делает данный скрипт
-1. Создаёт недостающую junction-связь каталога:
-   `Plugins\localuser\oc` ➔ `Plugins\oc`
-   *(с автоматическим резервным копированием файлов, если создание junction заблокировано).*
-2. Перезапускает службу `NvContainerLocalSystem` и закрывает зависшие пользовательские процессы `nvcontainer.exe` и `NVIDIA App.exe`.
-3. При следующем запуске `nvcontainer.exe` успешно подхватывает плагин разгона, и автоматическая настройка начинает работать штатно.
+1. **Восстанавливает плагин**: Создаёт NTFS-связь (junction) `Plugins\localuser\oc` ➔ `Plugins\oc` (или копирует файлы при запрете связей).
+2. **Исправляет логику интерфейса**: Патчит `www\main.*.js` (с созданием резервной копии `.bak`):
+   - Исправляет проверку статуса: тумблер зажигается только при реальном разгоне `averageGpuClockOffsetMhz > 0`.
+   - Разрешает отключение тумблера без падения в ошибку, если драйвер вернул `-104`.
+3. **Очищает кэш UI**: Удаляет кэш CEF для мгновенного применения обновлённого скрипта.
+4. **Перезапускает службы**: Перезапускает службу `NvContainerLocalSystem` и закрывает зависшие процессы `NVIDIA App.exe` и `nvcontainer.exe`.
 
 ---
 
 ### Инструкция по запуску
 
-#### Способ 1: Пакетный файл `.bat` (Самый простой)
+#### Вариант 1: Через `.bat` в один клик
 1. Скачайте [Fix_NVIDIA_App.bat](Fix_NVIDIA_App.bat).
-2. Запустите двойным кликом (скрипт сам запросит права Администратора).
-3. Дождитесь подтверждения выполнения.
+2. Запустите двойным кликом (скрипт автоматически запросит права Администратора).
 
-#### Способ 2: PowerShell `.ps1`
+#### Вариант 2: Через PowerShell `.ps1`
 1. Скачайте [Fix_NVIDIA_App.ps1](Fix_NVIDIA_App.ps1).
-2. Нажмите правой кнопкой мыши -> **Выполнить с помощью PowerShell** (или в консоли PowerShell от имени Администратора):
+2. Запустите правой кнопкой мыши -> **Выполнить с помощью PowerShell** (или в терминале от имени Администратора):
    ```powershell
    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
    .\Fix_NVIDIA_App.ps1
    ```
 
-#### Способ 3: Вручную через командную строку
-Откройте **Командную строку от имени Администратора** и выполните:
-```cmd
-mklink /J "%ProgramFiles%\NVIDIA Corporation\NVIDIA App\Plugins\localuser\oc" "%ProgramFiles%\NVIDIA Corporation\NVIDIA App\Plugins\oc"
-net stop NvContainerLocalSystem
-net start NvContainerLocalSystem
-taskkill /f /im nvcontainer.exe /fi "SESSION ne 0"
-taskkill /f /im "NVIDIA App.exe"
-```
-
----
-
-### Рекомендации перед запуском автоматической настройки
-- **Закройте фоновые программы**: Перед стартом тестирования закройте игры, бенчмарки, браузеры и плееры с аппаратным ускорением GPU (Discord, Steam, Wallpaper Engine). Видеокарта должна находиться в режиме простоя (Idle).
-- **Время тестирования**: Сканирование кривой частот и напряжений занимает в среднем от 10 до 20 минут.
-- **Мерцание экрана**: В процессе теста экран может кратковременно моргать или гаснуть на секунду — это нормальное поведение при подборе предельных частот.
-
----
-
-### Статус обращения в NVIDIA
-Подробное описание ошибки и причин её возникновения отправлено разработчикам через встроенную форму обратной связи **NVIDIA App Feedback**. Как только NVIDIA исправит файл манифеста `NvApp.nvi` в очередном обновлении приложения, ручное исправление больше не потребуется.
-
 ---
 
 ### Лицензия
-Данный проект распространяется под лицензией [MIT](LICENSE).
+Распространяется под лицензией [MIT](LICENSE).
