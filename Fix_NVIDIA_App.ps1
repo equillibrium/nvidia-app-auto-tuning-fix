@@ -1,4 +1,5 @@
 # NVIDIA App Automatic Tuning Fix
+# Verified with: NVIDIA App v11.0.9.585+ | GeForce Game Ready Driver v621.14+ (RTX 50-series / 40-series / 30-series)
 # Fixes:
 # 1. Missing overclocking plugin in NvContainer (junction link Plugins\localuser\oc -> Plugins\oc).
 # 2. NVIDIA App 11.0.9+ stuck slider bug (slider shows ON with +0 MHz on launch).

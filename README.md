@@ -2,13 +2,25 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20(64--bit)-lightgrey.svg)]()
-[![Tested with NVIDIA App](https://img.shields.io/badge/NVIDIA%20App-v11.0.9%2B-green.svg)]()
+[![Tested with NVIDIA App](https://img.shields.io/badge/NVIDIA%20App-v11.0.9.585%2B-green.svg)]()
+[![Tested with GeForce Driver](https://img.shields.io/badge/GeForce%20Driver-v621.14%2B-green.svg)]()
 
 A lightweight, automated fix for issues with **Automatic Tuning** (GPU auto-overclocking) in **NVIDIA App**:
 1. **Toggle resets or fails to start** (0% stuck / immediately unchecks).
 2. **Stuck slider / Ghost Tuning** (slider shows ON with +0 MHz, cannot be turned off, throws *"Something went wrong"*).
 3. **Scan fails to start when enabling toggle** (throws *"Something went wrong"* due to background OC scan returning NvAPI error `-104` on newer GPUs/drivers like RTX 50-series / 621+).
 4. **Authenticode integrity & Admin Consent** (configures registry consent natively, keeping digital signatures intact and preventing NvContainer error `2148098064`).
+
+---
+
+### Compatibility / Совместимость
+
+| Component | Verified / Supported Versions |
+|---|---|
+| **NVIDIA App** | `v11.0.9.585` and newer (`11.0.x`) |
+| **GeForce Game Ready Driver** | `v621.14` and newer (`621.xx+`, `620.xx+`, `566.xx+`) |
+| **Graphics Cards** | GeForce RTX 50-series (Blackwell: 5090, 5080, 5070 Ti, 5070), RTX 40-series, RTX 30-series, RTX 20-series, GTX 16-series |
+| **Operating System** | Windows 10 / Windows 11 (64-bit) |
 
 ---
 
