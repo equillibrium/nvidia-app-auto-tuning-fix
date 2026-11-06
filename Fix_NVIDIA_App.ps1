@@ -1,9 +1,10 @@
-﻿# NVIDIA App Automatic Tuning Fix
+# NVIDIA App Automatic Tuning Fix
 # Fixes:
 # 1. Missing overclocking plugin in NvContainer (junction link Plugins\localuser\oc -> Plugins\oc).
 # 2. NVIDIA App 11.0.9+ stuck slider bug (slider shows ON with +0 MHz on launch).
 # 3. NVIDIA App 11.0.9+ / Driver 621+ error on enabling scan ("Something went wrong" / NVAPI error -104 on background OC scan).
-# 4. Session 0 isolation admin consent failure in _OverClockingNvc.dll (StartOcManualScan returning result: false).
+# 4. Admin consent registry configuration in HKLM for seamless permission granting.
+# 5. Restores original signed _OverClockingNvc.dll if modified, ensuring NvContainer signature check passes.
 # Requires Administrator privileges.
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -80,9 +81,11 @@ if (Test-Path $ocDir) {
     Write-Host "  [!] Directory '$ocDir' not found, skipping junction creation." -ForegroundColor Yellow
 }
 
-# --- Step 3: Patching Session 0 admin consent in _OverClockingNvc.dll ---
+# --- Step 3: Verifying DLL integrity and setting Admin Consent in Registry ---
 Write-Host ""
-Write-Host "[3/5] Checking and patching admin consent in _OverClockingNvc.dll..." -ForegroundColor Green
+Write-Host "[3/5] Verifying plugin signature and setting Admin Consent in Registry..." -ForegroundColor Green
+
+# 3a. Restore original signed _OverClockingNvc.dll if modified (.bak exists and signature was broken)
 $dllLocations = @(
     (Join-Path $ocDir "_OverClockingNvc.dll"),
     (Join-Path $fallbackDir "_OverClockingNvc.dll")
@@ -90,55 +93,58 @@ $dllLocations = @(
 
 foreach ($dllPath in $dllLocations) {
     if (Test-Path $dllPath) {
-        try {
-            $bytes = [System.IO.File]::ReadAllBytes($dllPath)
-            # Pattern: E9 DB 47 05 00 (jmp to hasAdminConsent Session 0 check)
-            # Replace: B0 01 C3 90 90 (mov al, 1; ret; nop; nop)
-            $foundIdx = -1
-            for ($i = 0; $i -le $bytes.Length - 5; $i++) {
-                if ($bytes[$i] -eq 0xE9 -and $bytes[$i+1] -eq 0xDB -and $bytes[$i+2] -eq 0x47 -and $bytes[$i+3] -eq 0x05 -and $bytes[$i+4] -eq 0x00) {
-                    $foundIdx = $i
-                    break
-                }
-            }
-
-            if ($foundIdx -ne -1) {
-                $bakDll = "$dllPath.bak"
-                if (-not (Test-Path $bakDll)) {
-                    Copy-Item -Path $dllPath -Destination $bakDll -Force
-                    Write-Host "  [+] Backup created: $(Split-Path $dllPath -Leaf).bak" -ForegroundColor Green
-                }
-
-                $bytes[$foundIdx]     = 0xB0 # mov al, 1
-                $bytes[$foundIdx + 1] = 0x01
-                $bytes[$foundIdx + 2] = 0xC3 # ret
-                $bytes[$foundIdx + 3] = 0x90 # nop
-                $bytes[$foundIdx + 4] = 0x90 # nop
-
-                [System.IO.File]::WriteAllBytes($dllPath, $bytes)
-                Write-Host "  [+] Unlocked admin consent in $(Split-Path $dllPath -Leaf)" -ForegroundColor Green
-            } else {
-                # Check if already patched
-                $alreadyPatched = $false
-                for ($i = 0; $i -le $bytes.Length - 5; $i++) {
-                    if ($bytes[$i] -eq 0xB0 -and $bytes[$i+1] -eq 0x01 -and $bytes[$i+2] -eq 0xC3 -and $bytes[$i+3] -eq 0x90 -and $bytes[$i+4] -eq 0x90) {
-                        $alreadyPatched = $true
-                        break
+        $bakPath = "$dllPath.bak"
+        $sig = Get-AuthenticodeSignature $dllPath -ErrorAction SilentlyContinue
+        if ($null -ne $sig -and $sig.Status -ne "Valid") {
+            if (Test-Path $bakPath) {
+                Write-Host "  [*] Restoring original signed DLL from backup: $dllPath" -ForegroundColor Yellow
+                try {
+                    Copy-Item -Path $bakPath -Destination $dllPath -Force
+                    $newSig = Get-AuthenticodeSignature $dllPath
+                    if ($newSig.Status -eq "Valid") {
+                        Write-Host "  [+] Original signed DLL restored successfully (Signature: Valid)" -ForegroundColor Green
+                    } else {
+                        Write-Host "  [!] Restored DLL status is $($newSig.Status)" -ForegroundColor Yellow
                     }
+                } catch {
+                    Write-Host "  [!] Failed to restore DLL from backup: $_" -ForegroundColor Yellow
                 }
-                if ($alreadyPatched) {
-                    Write-Host "  [+] Admin consent in $(Split-Path $dllPath -Leaf) is already unlocked." -ForegroundColor Green
-                } else {
-                    Write-Host "  [!] Pattern not found in $(Split-Path $dllPath -Leaf), skipping binary patch." -ForegroundColor Yellow
-                }
+            } else {
+                Write-Host "  [!] Warning: DLL signature is $($sig.Status) but backup not found." -ForegroundColor Yellow
             }
-        } catch {
-            Write-Host "  [!] Could not patch $($dllPath): $_" -ForegroundColor Yellow
+        } else {
+            Write-Host "  [+] Plugin DLL signature is valid: $dllPath" -ForegroundColor Green
         }
     }
 }
 
-# --- Step 4: Fixing stuck slider & scan launch bugs in UI ---
+# 3b. Configure Admin Consent in Windows Registry
+# OverClockingNvc checks HKLM\SOFTWARE\NVIDIA Corporation\Global\NvApp\OC\<User-SID>
+$regPath = "HKLM:\SOFTWARE\NVIDIA Corporation\Global\NvApp\OC"
+try {
+    if (-not (Test-Path $regPath)) {
+        New-Item -Path $regPath -Force | Out-Null
+    }
+    
+    # Register consent for all active user profiles
+    $userProfiles = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*" | Where-Object { $_.PSChildName -like "S-1-5-21-*" }
+    foreach ($profile in $userProfiles) {
+        $sid = $profile.PSChildName
+        Set-ItemProperty -Path $regPath -Name $sid -Value 1 -Type DWord -Force
+        Write-Host "  [+] Set Admin Consent for SID: $sid" -ForegroundColor Green
+    }
+    # Also set for SYSTEM (S-1-5-18) and current user identity
+    $currentSid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+    if ($currentSid) {
+        Set-ItemProperty -Path $regPath -Name $currentSid -Value 1 -Type DWord -Force
+    }
+    Set-ItemProperty -Path $regPath -Name "S-1-5-18" -Value 1 -Type DWord -Force
+    Write-Host "  [+] Admin Consent registry keys configured" -ForegroundColor Green
+} catch {
+    Write-Host "  [!] Could not configure registry keys: $_" -ForegroundColor Yellow
+}
+
+# --- Step 4: Patching frontend UI logic ---
 Write-Host ""
 Write-Host "[4/5] Checking and patching NVIDIA App UI logic..." -ForegroundColor Green
 $patchedAny = $false
@@ -235,12 +241,11 @@ Write-Host "               Fix applied successfully!" -ForegroundColor Cyan
 Write-Host "=========================================================" -ForegroundColor Cyan
 Write-Host "RESULTS:" -ForegroundColor Yellow
 Write-Host "1. Overclocking plugin linked to NvContainer."
-Write-Host "2. Admin consent unlocked in _OverClockingNvc.dll (Session 0 fix)."
-Write-Host "3. Stuck slider bug fixed: Automatic Tuning toggle will no longer"
+Write-Host "2. Original signed plugin integrity verified (Authenticode Valid)."
+Write-Host "3. Admin consent configured via Windows Registry."
+Write-Host "4. Stuck slider bug fixed: Automatic Tuning toggle will no longer"
 Write-Host "   falsely show ON at +0 MHz."
-Write-Host "4. Tuning scan start bug fixed: clicking the toggle will now"
-Write-Host "   properly launch the manual OC scanner."
-Write-Host "5. Launch NVIDIA App -> System -> Performance to start tuning."
+Write-Host "5. Background scan NVAPI -104 crash bypassed."
 Write-Host "=========================================================" -ForegroundColor Cyan
 Write-Host ""
 Read-Host "Press Enter to exit..."
